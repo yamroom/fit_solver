@@ -1,0 +1,259 @@
+fit_modified_final_rel 使用手冊（v2025-08-29）
+
+# 概覽
+`fit_modified_final_rel.py` 是一個以 **自訂函式** 與 **CSV 實驗資料** 為輸入，透過多起點最佳化（multi-start）進行 **非線性曲線擬合** 的命令列工具。它會輸出：
+
+- 參數估計（`params.csv`）
+- 擬合對照表（`fitted.csv`）
+- 覆蓋密集網格的預測（`grid.csv`）
+- 品質與約束檢查（`checks.json`）
+- 視覺化曲線（`plots_i=*.png`）
+
+> 本手冊說明：資料/函式格式、求解邏輯、常用參數、輸出檔案、典型工作流程、調參策略與故障排除。
+
+---
+
+# 結構圖（資料流程與模組）
+```
+┌──────────────────┐      ┌────────────────┐
+│  data.csv        │      │  function.txt  │
+│ (g,i,x,y)        │      │ y = f(x,i;θ)   │
+└────────┬─────────┘      └───────┬────────┘
+         │                         │
+         │ load/validate           │ parse/symbolize
+         ▼                         ▼
+   ┌──────────────────────────────────────────┐
+   │              模型建構與目標             │
+   │  • y_hat(x,i;θ)                         │
+   │  • 誤差：abs 或 relative                │
+   │  • 正則：平滑 (λ_s) / 跨群相似 (λ_sim)  │
+   └───────────────┬─────────────────────────┘
+                   │
+                   │  choose solver & multi-start
+                   ▼
+        ┌────────────────────────────────┐
+        │最佳化器                        │
+        │ • least_squares (TRF)         │
+        │ • minimize (trust-constr/SLSQP)│
+        └───────────────┬────────────────┘
+                        │  θ*, 診斷
+                        ▼
+   ┌──────────────────────────────────────────┐
+   │ 輸出：params / fitted / grid / checks /  │
+   │       plots                              │
+   └──────────────────────────────────────────┘
+```
+
+---
+
+# 輸入格式
+## 1) `data.csv`
+- **必備欄位**（順序不限）：`g, i, x, y`
+  - `g`：群組（可用於多條曲線同時擬合；只有一組資料時也需存在）
+  - `i`：控制/條件參數（連續或離散皆可；例如 0.5、0.999）
+  - `x`：自變數
+  - `y`：觀測值（目標）
+- **CSV 規格**：逗號分隔、無空白行、無缺失值（NaN）、小數點使用 `.`；建議 UTF-8 無 BOM。
+- **例**：
+  ```csv
+  g,i,x,y
+  1,0.5,0.3,0.032
+  1,0.5,0.4769,0.0167
+  ...
+  1,0.999,1.1,0.0571
+  ```
+
+## 2) `function.txt`
+- 內容是一條可被解析的 **數學表達式**，定義 `y_hat = f(x, i; θ)`。
+- **運算子/函數**：`+ - * /`、括號 `()`、`exp()`、`ln()`；（**不要**省略乘號 `*`；**不要**用 `^` 當次方）。
+- **參數命名**：自由；常見如 `C1_A, C1_B, C2_A, ...`（實際名稱會自動被偵測並估計）。
+- **範例（已修正語法）**：
+  ```
+  -( ln(-ln(i)) + 0.03332*(C2_A + C2_B*(1.1 - x)*(1.1 - x) + C2_C*exp(1.1 - x) + C2_D*exp(x - 1.1)) )
+  /( 25.63*(C1_A + C1_B*(1.1 - x)*(1.1 - x) + C1_C*exp(1.1 - x) + C1_D*exp(x - 1.1)) )
+  ```
+- **數值領域小心**：若表達式包含 `ln(-ln(i))`，需 **0<i<1** 才有定義（`ln(i)<0 → -ln(i)>0 → ln(...)` 才成立）。
+
+---
+
+# 求解邏輯與目標函數
+- 預測：`y_hat = f(x,i;θ)`，θ 為待估參數向量。
+- 目標：最小化 **損失(資料殘差) + 正則(可選)**：
+  - **資料殘差**（二擇一）
+    - 絕對殘差（預設）：`Σ w_k · (y_k - y_hat_k)^2`
+    - 相對殘差（`--relative-error`）：近似 `Σ w_k · ((y_k - y_hat_k) / (|y_k|+ε))^2`，使小量級 y 的相對偏差也被重視。
+  - **平滑正則**（`--lambda-s`）：抑制 θ 所導致的曲線**高頻起伏**（避免 overfit / “鋸齒”）。
+  - **跨群相似正則**（`--lambda-sim`）：多群組 (`g`) 情境下，鼓勵不同群組的參數彼此接近（**單一群組時不生效**）。
+- 權重：`--balance-i` 會在不同 `i` 水平間做**樣本平衡**，避免某些 `i` 因點數多而主宰擬合。
+
+---
+
+# 最佳化器與限制式
+- `--solver least_squares`（預設）：使用 SciPy 類 TRF 的殘差最小化，速度快、穩定。
+- `--solver minimize`：使用 **trust-constr（主）/ SLSQP（備）** 的一般限制式最小化，便於 **單調性、排序、分母安全界** 等**硬約束**（若腳本啟用這些內建檢查/懲罰，會在 `checks.json` 反映指標與方法）。
+- `--restarts N`：多起點（multi-start）避免落入局部解，通常建議 `8–32`。
+- `--seed`：控制起點與隨機行為的再現性。
+- `--grid-points M`：用於密集網格評估（繪圖/檢查/約束），M 越大精細但成本更高；常見 `100–400`。
+
+> `checks.json` 會記錄如 `monotonicity_violation_max`、`ordering_violation_max`、`denominator_min_abs` 等指標，幫助你審視是否需要開啟限制式解法或調整正則。
+
+---
+
+# 命令列參數（摘要表）
+| 參數 | 型別/範例 | 預設 | 作用 | 何時調整 |
+|---|---|---:|---|---|
+| `--data` | 路徑，如 `data.csv` | 無 | 輸入資料 | 必填 |
+| `--func` | 路徑，如 `function.txt` | 無 | 自訂函式 | 必填 |
+| `--outdir` | 資料夾 | 無 | 輸出位置 | 必填 |
+| `--solver` | `least_squares` / `minimize` | `least_squares` | 求解器 | 需硬約束或失敗時改用 `minimize` |
+| `--restarts` | 整數，如 `16` | `8`（視版本） | 多起點數 | 資料嘈雜/非凸時↑ |
+| `--seed` | 整數，如 `1` | 固定種子 | 再現性 | 報告/比對用 |
+| `--balance-i` | flag | 關 | `i` 水平平衡權重 | `i` 分佈不均時開啟 |
+| `--relative-error` | flag | 關 | 使用相對誤差 | 小 y 相對誤差需更準時 |
+| `--grid-points` | 整數，如 `200` | `200` | 估計/檢查網格密度 | 想要更細的圖或約束時↑ |
+| `--lambda-s` | 浮點，如 `1e-4` | `0` 或小值 | 平滑正則 | 曲線起伏大時↑ |
+| `--lambda-sim` | 浮點，如 `1e-3` | `0` | 跨群參數相似 | 多 `g`、希望群間一致時↑ |
+| `--verbose` | flag | 關 | 額外日誌輸出 | 除錯時 |
+
+> 註：不同版本的預設值可能略異；實際以 `checks.json` 的 `config` 區塊為準。
+
+---
+
+# 典型工作流程（建議步驟）
+1. **準備**
+   - 整理 `data.csv`（檢查欄位與數值）
+   - 撰寫/檢查 `function.txt`（乘號、括號、函數名是否正確）
+2. **基線擬合**（速度快、穩定）
+   ```bash
+   python fit_modified_final_rel.py \
+     --data data.csv \
+     --func function.txt \
+     --outdir out_base \
+     --solver least_squares \
+     --restarts 16 \
+     --balance-i \
+     --grid-points 200
+   ```
+3. **檢查輸出**
+   - 看 `plots_i=*.png` 是否貼點、是否出現不合理轉折
+   - 開啟 `checks.json`：
+     - `monotonicity_violation_max` 是否接近 0
+     - `denominator_min_abs` 是否遠離 0
+     - `rmse` / 每層 `i` 的誤差（若 `fitted.csv` 提供 `y_hat` 可自行算殘差）
+4. **針對問題調參**
+   - **小 y 相對誤差不滿意** → 加 `--relative-error`
+   - **曲線鋸齒/過擬合** → 提高 `--lambda-s`（如 `5e-4 → 1e-3`）
+   - **易落局部解** → 提高 `--restarts`（如 `8 → 24`）
+   - **需要硬性單調/排序** → 改 `--solver minimize`，並可適度**降低** `--grid-points` 提升速度（例如 200 → 120）
+   - **多群組需一致性** → 設定 `--lambda-sim`（單一群組時無效）
+5. **定版**
+   - 固定 `--seed`，保留命令、`data.csv`、`function.txt` 與 `outdir` 作為報告與再現性依據。
+
+---
+
+# 輸出檔案格式
+## 1) `params.csv`
+- 參數名與估計值，例：
+  ```csv
+  name,value
+  C1_A, ...
+  C1_B, ...
+  ...
+  ```
+
+## 2) `fitted.csv`
+- 最小包含：`g,i,x,y,y_hat`（部分版本含殘差或權重）。
+- 用途：檢查每個觀測點的擬合情形、統計誤差（可自算 `resid=y_hat-y`、RMSE、MAPE）。
+
+## 3) `grid.csv`
+- 在每個 `(g,i)` 上，對密集 `x` 網格的 `y_hat` 預測，用於繪圖與檢查約束（單調性等）。
+
+## 4) `checks.json`
+- **必要閱讀**的品質指標與設定摘要，例如：
+  - `spec_version`：規格版本（便於跨版本相容性）
+  - `function`：函式摘要（截斷顯示）
+  - `params`：參數名列表
+  - `per_i`：逐 `i` 的檢查（如 `monotonicity_violation_max`, `ordering_violation_max`, `denominator_min_abs`）
+  - `optimizer`/`solver`：是否成功、訊息、疊代次數等
+  - `config`：實際生效的超參數（`lambda_s`, `lambda_sim`, `order_mode`, `method_primary` 等）
+
+## 5) `plots_i=*.png`
+- 各 `i` 水準的觀測點 vs. 擬合曲線圖。
+
+---
+
+# 調參策略（實務建議）
+- **先求穩定、再求極致**：以 `least_squares + balance-i + 適中 restarts` 打底。
+- **相對誤差**：當資料量級差異大，或你關注小 `y` 的比例偏差。
+- **平滑正則 λ_s**：避免過擬合的主要旋鈕；太大會欠擬合（曲線被拉直）。
+- **多起點 restarts**：非凸問題常見；加大至 16–32 通常能提升穩健度。
+- **限制式解法**：單調/排序是業務硬需求時才開；必要時同步**降低**網格密度以控制耗時。
+- **可識別性**：參數多、資料少時，建議（1）增加 `x` 取樣點，（2）先固定/移除弱影響項，（3）加一點正則。
+
+---
+
+# 常見錯誤與排解
+- **函式語法錯誤**：確保所有乘法都有 `*`，使用 `exp()`/`ln()`，不要用 `^`。
+- **數值域錯誤**：`ln(-ln(i))` 要求 `0<i<1`；若 `i` 太貼近 1，可能產生極端梯度，建議使用相對誤差或適度平滑。
+- **CSV 欄位/型別錯**：檢查標頭是否精確為 `g,i,x,y`、是否存在空值或額外空白。
+- **不收斂/時間過長**：
+  - 降低 `--grid-points`（如 200→120）
+  - 降低 `--restarts` 或先用 `least_squares` 調參
+  - 提高 `--lambda-s` 或簡化函式形態
+- **結果抖動（重跑差異大）**：固定 `--seed`；提高 `--restarts`。
+
+---
+
+# 最佳實務（Repro 與版本紀錄）
+- 每次跑完：把 **命令列**、`data.csv`、`function.txt`、`outdir` 一起留存。
+- 以 `checks.json` 中的 `spec_version` + `config` 當作**證明**你當時的設定。
+- 在報告中**同時提供** `params.csv` 與關鍵圖檔，便於他人驗證。
+
+---
+
+# 範例命令
+### 基線（建議起手式）
+```bash
+python fit_modified_final_rel.py \
+  --data data.csv \
+  --func function.txt \
+  --outdir out_lsq_base \
+  --solver least_squares \
+  --restarts 16 \
+  --balance-i \
+  --grid-points 200
+```
+
+### 偏重小 y 的比例誤差
+```bash
+python fit_modified_final_rel.py \
+  --data data.csv --func function.txt --outdir out_rel \
+  --solver least_squares --restarts 16 --balance-i --relative-error
+```
+
+### 更平滑、避免高頻抖動
+```bash
+python fit_modified_final_rel.py \
+  --data data.csv --func function.txt --outdir out_smooth \
+  --solver least_squares --restarts 16 --balance-i \
+  --lambda-s 5e-4
+```
+
+### 需要單調/排序等硬約束（計算較久）
+```bash
+python fit_modified_final_rel.py \
+  --data data.csv --func function.txt --outdir out_constrained \
+  --solver minimize --restarts 8 --balance-i --grid-points 120 \
+  --lambda-s 5e-4
+```
+
+---
+
+# 附錄：快速檢查清單
+- [ ] `data.csv` 欄位正確、無缺失
+- [ ] `function.txt` 語法正確、領域安全（如 `0<i<1`）
+- [ ] 先跑基線、觀察 `plots` 與 `checks.json`
+- [ ] 依需求選擇 `--relative-error / --lambda-s / --solver minimize`
+- [ ] 固定 `--seed` 以利再現
+
+> 若需要把本手冊轉成 PDF 或加上你公司的具體規範，我可以再幫你彙編成正式文件模板。
